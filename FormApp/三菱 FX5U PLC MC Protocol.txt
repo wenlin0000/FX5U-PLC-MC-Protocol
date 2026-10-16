@@ -1,0 +1,118 @@
+﻿# 三菱 FX5U PLC - MC Protocol (3E 訊框) C# 非同步通訊核心
+
+本專案提供一個純原生 C# (`.NET`) 實作的 **三菱 FX5U PLC** 通訊方案。底層採用 **MC Protocol (3E 訊框二進位格式)**，無須依賴任何收費或龐大的第三方通訊 DLL 套件。
+
+核心架構全面升級為 `async/await` 非同步版本，並內建執行緒安全排隊鎖，專為高穩定性工業自動化（如 HMI 監控看板、生產數據採集）設計。
+
+## ?? 核心優勢
+1. **介面永不卡死**：通訊完全在背景執行，UI 拖曳、點擊維持極致流暢。
+2. **免用 Invoke**：利用 `async/await` 機制，通訊完成後自動返回 UI 主執行緒，直接安全更新控制項。
+3. **執行緒防衝突鎖**：內建 `SemaphoreSlim` 訊號鎖，當「背景定時讀取」與「按鈕插隊寫入」同時發生時，自動排隊通訊，徹底杜絕 TCP 訊框錯亂。
+4. **自訂低延時逾時**：修正原生 `TcpClient` 連線卡死高達 20 秒的問題，可在連線或傳輸異常時（如拔線、斷電）在 2 秒內快速回報。
+
+---
+
+## ??? PLC 端必要設定 (GX Works3)
+
+在與 C# 進行通訊前，請確保 PLC 側已開啟對應的連接埠：
+1. 開啟 **GX Works3** 專案。
+2. 導航至：**參數** -> **FX5UCPU** -> **模組參數** -> **乙太網路埠**。
+3. 找到 **對象設備連接設定**，將其中一個通道新增為 **SLMP 連接設備**（SLMP 即為 3E 訊框）。
+4. 設定參數如下：
+   * **通訊協定**：`TCP`
+   * **通訊埠號 (Port)**：自訂（例如 `5002`）
+5. 將參數寫入 PLC 並重啟（RUN/STOP 切換或重新斷送電）。
+
+---
+
+## ?? 功能支援矩陣
+
+| 功能方法 | 支援軟元件 | 單位格式 | 應用場景 |
+| :--- | :--- | :--- | :--- |
+| `ReadAsync` | D 暫存器 (`0xA8`) | 16-bit 字組 (Word) 批量 | 背景定時刷新、看板數值監控 |
+| `RandomWriteAsync` | D 暫存器 (`0xA8`) | 16-bit 字組 (Word) 隨機 | 寫入多個不連續的製程參數 |
+| `WriteSingleRelayAsync` | M 線圈 (`0x90`) | 1-bit 位元 (Bit) 單點 | 控制實體按鈕（如啟動、停止馬達） |
+
+---
+
+## ?? 核心程式碼結構說明
+
+專案核心通訊組件包裝於 `FX5UClient.cs` 類別中，其內部核心架構如下：
+
+### 1. 安全執行緒機制 (Thread-Safe)
+```csharp
+private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
+```
+所有讀寫 API 均受此訊號鎖保護，使用 `try-finally` 結構確保通行證不論通訊成功或失敗皆能被安全釋放。
+
+### 2. 精準結束代碼 (End Code) 檢查
+```csharp
+ushort endCode = BitConverter.ToUInt16(responseBuffer, 9);
+if (endCode != 0) throw new Exception($"PLC 回報異常，錯誤碼: 0x{endCode:X4}");
+```
+修正了陣列位移錯誤，精準由回應訊框的第 9, 10 位元組（小端序）抽取出 PLC 運作狀態。
+
+---
+
+## ? 快速使用範例
+
+### 初始化客戶端
+```csharp
+// 建立連線實例：設定 IP、Port 與 2秒通訊逾時
+FX5UClient _plcClient = new FX5UClient("192.168.3.250", 5002, timeoutMs: 2000);
+```
+
+### A. 背景定時自動刷新 (以 500ms 迴圈為例)
+```csharp
+private async Task DoPlcPollingLoopAsync(CancellationToken token)
+{
+    using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
+    while (!token.IsCancellationRequested)
+    {
+        try
+        {
+            // 非同步批量讀取連續 5 個 Word (D100 ~ D104)
+            short[] plcValues = await _plcClient.ReadAsync(100, 5);
+
+            // 自動返回 UI 執行緒，直接安全更新介面
+            txtD100.Text = plcValues[0].ToString();
+            lblStatus.Text = "通訊正常";
+        }
+        catch (Exception ex)
+        {
+            lblStatus.Text = $"通訊異常: {ex.Message}";
+        }
+        await timer.WaitForNextTickAsync(token);
+    }
+}
+```
+
+### B. 按鈕事件：隨機寫入多個不連續地址
+```csharp
+private async void btnWrite_Click(object sender, EventArgs e)
+{
+    var writeList = new List<FX5UClient.WriteTarget>()
+    {
+        new FX5UClient.WriteTarget(100, 777), // D100 寫入 777
+        new FX5UClient.WriteTarget(150, 888)  // D150 寫入 888
+    };
+
+    await _plcClient.RandomWriteAsync(writeList); // 自動排隊，絕不與背景刷新衝突
+}
+```
+
+### C. 按鈕事件：控制單點 M 線圈 (ON/OFF)
+```csharp
+private async void btnM10On_Click(object sender, EventArgs e)
+{
+    await _plcClient.WriteSingleRelayAsync(10, true); // 控制 M10 變為 ON
+}
+```
+
+---
+
+## ?? 開發與現施工調試注意事項
+
+1. **資料範圍限制**：單個 Word 暫存器在 C# 中對應 `short` 型別，給值時範圍必須在 `-32768` 到 `32767` 之間。若要寫入 32 位元資料（`DWord` / `Int32` / `Float`），需佔用 2 個 Word，請留意 Byte Swap（高低位對調）的現場狀況。
+2. **軟體釋放**：視窗關閉事件 (`OnFormClosing`) 內務必執行 `CancellationTokenSource.Cancel()`，以徹底關閉背景 Polling 執行緒，防止其轉化為作業系統內的殭屍處理程序。
+3. **錯誤碼調試**：若 `endCode` 出現非 0 數值，請對照三菱官方手冊（*MELSEC iQ-F FX5 User's Manual (SLMP)*）查閱對應的異常代碼（例如 `0xC059` 代表指定地址超出範圍）。
